@@ -1,4 +1,8 @@
 import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = (
+    "TRUE"  # Allows multiple OpenMP runtimes (temporary fix)
+)
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 from dotenv import load_dotenv
 import cv2
 import torch
@@ -34,11 +38,6 @@ import io
 import asyncio
 import json
 import httpx
-
-os.environ["KMP_DUPLICATE_LIB_OK"] = (
-    "TRUE"  # Allows multiple OpenMP runtimes (temporary fix)
-)
-os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 
 # Load environment variables from .env file
 load_dotenv()
@@ -828,6 +827,7 @@ class ProcessPeriodicRequest(BaseModel):
     quiz_id: str
     image_b64: str
     auth_token: str
+    image_b64: str
 
 
 # Pydantic model for /submit_due_to_cheating input
@@ -871,18 +871,23 @@ async def log_cheating_to_laravel(
     alerts: List[str],
     score_increment: int,
     auth_token: str,
+    image_b64: str = None,
 ):
-    """Send suspicious behaviors and score update to Laravel"""
+    """Send suspicious behaviors and score update to Laravel, and cheating image to Laravel"""
     async with httpx.AsyncClient() as client:
         try:
+            payload = {
+                "student_id": student_id,
+                "quiz_id": quiz_id,
+                "score_increment": score_increment,
+                "alerts": alerts,
+            }
+            if image_b64:  # Include image data if provided
+                payload["image_b64"] = image_b64
+                
             response = await client.post(
                 "http://localhost:8000/api/quizzes/update-cheating-score",
-                json={
-                    "student_id": student_id,
-                    "quiz_id": quiz_id,
-                    "score_increment": score_increment,
-                    "alerts": alerts,
-                },
+                json=payload,
                 headers={
                     "Authorization": f"Bearer {auth_token}",
                     "Accept": "application/json",
@@ -989,6 +994,7 @@ async def process_periodic(request: ProcessPeriodicRequest):
                 result["alerts"],
                 result["score_increment"],
                 request.auth_token,
+                request.image_b64,
             )
             ws_message = {
                 "type": "alert",
