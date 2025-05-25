@@ -1,4 +1,5 @@
 import os
+
 os.environ["KMP_DUPLICATE_LIB_OK"] = (
     "TRUE"  # Allows multiple OpenMP runtimes (temporary fix)
 )
@@ -49,6 +50,7 @@ DB_USERNAME = os.getenv("DB_USERNAME")
 DB_PASSWORD = os.getenv("DB_PASSWORD")
 FACE_MODEL_PATH = os.getenv("FACE_MODEL_PATH")
 HEAD_POSE_MODEL_PATH = os.getenv("HEAD_POSE_MODEL_PATH")
+OBJECT_DETECTION_MODEL_PATH = os.getenv("OBJECT_DETECTION_MODEL_PATH")
 
 os.environ.update(
     {
@@ -66,6 +68,11 @@ face_detector = YOLO(FACE_MODEL_PATH)
 # Load head pose estimation model
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 head_pose_model_path = HEAD_POSE_MODEL_PATH
+
+# Load object detection model
+object_detection_model = YOLO(OBJECT_DETECTION_MODEL_PATH).to(
+    "cuda" if torch.cuda.is_available() else "cpu"
+)
 
 
 class FaceDB:
@@ -623,6 +630,45 @@ async def detect_head_pose(face_region: Image.Image):
     }
 
 
+def detect_objects(image: Image.Image) -> List[Dict]:
+    """Run object detection to check for suspicious objects"""
+    try:
+        # Convert PIL Image to OpenCV format
+        image_np = np.array(image)
+        image_cv = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
+        # Resize to match training resolution (640x640)
+        image_cv = cv2.resize(image_cv, (640, 640))
+        results = object_detection_model(image_cv)
+        print(f"YOLO raw results: {results}")
+
+        suspicious_objects = []
+        for result in results:
+            boxes = result.boxes
+            for box in boxes:
+                if box.conf >= 0.5:
+                    cls = int(box.cls[0])  # Class index
+                    class_name = result.names[cls]  # Get class name
+                    x1, y1, x2, y2 = map(int, box.xyxy[0])
+                    # Scale back to original image size
+                    orig_width, orig_height = image.size
+                    x1 = int(x1 * orig_width / 640)
+                    y1 = int(y1 * orig_height / 640)
+                    x2 = int(x2 * orig_width / 640)
+                    y2 = int(y2 * orig_height / 640)
+                    suspicious_objects.append(
+                        {
+                            "class": class_name,
+                            "bounding_box": [x1, y1, x2, y2],
+                            "confidence": float(box.conf),
+                        }
+                    )
+        print(f"Suspicious objects: {suspicious_objects}")
+        return suspicious_objects
+    except Exception as e:
+        print(f"Error in detect_objects: {str(e)}")
+        return []
+
+
 async def process_image(image: Image.Image) -> Dict:
     """Process image with all models"""
     try:
@@ -636,6 +682,9 @@ async def process_image(image: Image.Image) -> Dict:
             face_region = image.crop((x1, y1, x2, y2))
             head_pose = await detect_head_pose(face_region)
             head_poses.append(head_pose)
+
+        # Run object detection (not async)
+        suspicious_objects = detect_objects(image)
 
         # Compute cheating score
         score_increment = 0
@@ -654,15 +703,28 @@ async def process_image(image: Image.Image) -> Dict:
             score_increment += CHEATING_WEIGHTS["non_frontal_pose"]
             alerts.append("Non-frontal pose detected")
 
+        # Check for suspicious objects
+        if suspicious_objects:
+            score_increment += CHEATING_WEIGHTS["suspicious_object"]
+            for obj in suspicious_objects:
+                alerts.append(f"Suspicious object detected: {obj['class']}")
+
         return {
             "faces": faces,
             "head_poses": head_poses,
+            "suspicious_objects": suspicious_objects,
             "score_increment": score_increment,
             "alerts": alerts,
         }
     except Exception as e:
         print(f"Error in process_image: {str(e)}")
-        return {"faces": [], "head_poses": [], "alerts": [], "score_increment": 0}
+        return {
+            "faces": [],
+            "head_poses": [],
+            "suspicious_objects": [],
+            "alerts": [],
+            "score_increment": 0,
+        }
 
 
 class RegisterRequest(BaseModel):
@@ -884,7 +946,7 @@ async def log_cheating_to_laravel(
             }
             if image_b64:  # Include image data if provided
                 payload["image_b64"] = image_b64
-                
+
             response = await client.post(
                 "http://localhost:8000/api/quizzes/update-cheating-score",
                 json=payload,
