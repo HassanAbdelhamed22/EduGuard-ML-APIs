@@ -630,6 +630,45 @@ async def detect_head_pose(face_region: Image.Image):
     }
 
 
+def detect_objects(image: Image.Image) -> List[Dict]:
+    """Run object detection to check for suspicious objects"""
+    try:
+        # Convert PIL Image to OpenCV format
+        image_np = np.array(image)
+        image_cv = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
+        # Resize to match training resolution (640x640)
+        image_cv = cv2.resize(image_cv, (640, 640))
+        results = object_detection_model(image_cv)
+        print(f"YOLO raw results: {results}")
+
+        suspicious_objects = []
+        for result in results:
+            boxes = result.boxes
+            for box in boxes:
+                if box.conf >= 0.5:
+                    cls = int(box.cls[0])  # Class index
+                    class_name = result.names[cls]  # Get class name
+                    x1, y1, x2, y2 = map(int, box.xyxy[0])
+                    # Scale back to original image size
+                    orig_width, orig_height = image.size
+                    x1 = int(x1 * orig_width / 640)
+                    y1 = int(y1 * orig_height / 640)
+                    x2 = int(x2 * orig_width / 640)
+                    y2 = int(y2 * orig_height / 640)
+                    suspicious_objects.append(
+                        {
+                            "class": class_name,
+                            "bounding_box": [x1, y1, x2, y2],
+                            "confidence": float(box.conf),
+                        }
+                    )
+        print(f"Suspicious objects: {suspicious_objects}")
+        return suspicious_objects
+    except Exception as e:
+        print(f"Error in detect_objects: {str(e)}")
+        return []
+
+
 async def process_image(image: Image.Image) -> Dict:
     """Process image with all models"""
     try:
