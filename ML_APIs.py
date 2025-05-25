@@ -1,4 +1,5 @@
 import os
+
 os.environ["KMP_DUPLICATE_LIB_OK"] = (
     "TRUE"  # Allows multiple OpenMP runtimes (temporary fix)
 )
@@ -49,6 +50,7 @@ DB_USERNAME = os.getenv("DB_USERNAME")
 DB_PASSWORD = os.getenv("DB_PASSWORD")
 FACE_MODEL_PATH = os.getenv("FACE_MODEL_PATH")
 HEAD_POSE_MODEL_PATH = os.getenv("HEAD_POSE_MODEL_PATH")
+OBJECT_DETECTION_MODEL_PATH = os.getenv("OBJECT_DETECTION_MODEL_PATH")
 
 os.environ.update(
     {
@@ -66,6 +68,11 @@ face_detector = YOLO(FACE_MODEL_PATH)
 # Load head pose estimation model
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 head_pose_model_path = HEAD_POSE_MODEL_PATH
+
+# Load object detection model
+object_detection_model = YOLO(OBJECT_DETECTION_MODEL_PATH).to(
+    "cuda" if torch.cuda.is_available() else "cpu"
+)
 
 
 class FaceDB:
@@ -884,7 +891,7 @@ async def log_cheating_to_laravel(
             }
             if image_b64:  # Include image data if provided
                 payload["image_b64"] = image_b64
-                
+
             response = await client.post(
                 "http://localhost:8000/api/quizzes/update-cheating-score",
                 json=payload,
