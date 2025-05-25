@@ -705,7 +705,7 @@ async def process_image(image: Image.Image) -> Dict:
 
         # Check for suspicious objects
         if suspicious_objects:
-            score_increment += CHEATING_WEIGHTS["suspicious_objects"]
+            score_increment += CHEATING_WEIGHTS["suspicious_object"]
             for obj in suspicious_objects:
                 alerts.append(f"Suspicious object detected: {obj['class']}")
 
