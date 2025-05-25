@@ -683,6 +683,9 @@ async def process_image(image: Image.Image) -> Dict:
             head_pose = await detect_head_pose(face_region)
             head_poses.append(head_pose)
 
+        # Run object detection (not async)
+        suspicious_objects = detect_objects(image)
+
         # Compute cheating score
         score_increment = 0
         alerts = []
@@ -700,15 +703,28 @@ async def process_image(image: Image.Image) -> Dict:
             score_increment += CHEATING_WEIGHTS["non_frontal_pose"]
             alerts.append("Non-frontal pose detected")
 
+        # Check for suspicious objects
+        if suspicious_objects:
+            score_increment += CHEATING_WEIGHTS["suspicious_objects"]
+            for obj in suspicious_objects:
+                alerts.append(f"Suspicious object detected: {obj['class']}")
+
         return {
             "faces": faces,
             "head_poses": head_poses,
+            "suspicious_objects": suspicious_objects,
             "score_increment": score_increment,
             "alerts": alerts,
         }
     except Exception as e:
         print(f"Error in process_image: {str(e)}")
-        return {"faces": [], "head_poses": [], "alerts": [], "score_increment": 0}
+        return {
+            "faces": [],
+            "head_poses": [],
+            "suspicious_objects": [],
+            "alerts": [],
+            "score_increment": 0,
+        }
 
 
 class RegisterRequest(BaseModel):
