@@ -988,7 +988,7 @@ yolo = YOLO(FACE_MODEL_PATH).to("cuda" if torch.cuda.is_available() else "cpu")
 recognizer = RealTimeRecognizer()
 
 # New global variables for gaze tracking
-CHECKPOINT_DIR = r"C:/Users/pc/Desktop/GP/ML Code"
+CHECKPOINT_DIR = os.getenv("GAZE_ESTIMATION_MODEL_PATH", "checkpoints")
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 gaze_model = None
 mp_face = None
