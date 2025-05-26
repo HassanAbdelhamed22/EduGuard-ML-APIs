@@ -39,6 +39,9 @@ import io
 import asyncio
 import json
 import httpx
+import mediapipe as mp
+from collections import deque
+import torch.nn as nn
 
 # Load environment variables from .env file
 load_dotenv()
@@ -668,6 +671,37 @@ def detect_objects(image: Image.Image) -> List[Dict]:
         print(f"Error in detect_objects: {str(e)}")
         return []
 
+# Gaze tracking model definition
+class GazeResNet18(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.base_model = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+        for i, (name, param) in enumerate(self.base_model.named_parameters()):
+            if i < 30:
+                param.requires_grad = False
+        num_features = self.base_model.fc.in_features
+        self.base_model.fc = nn.Sequential(
+            nn.Linear(num_features, 256),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(256, 3),
+            nn.Tanh()
+        )
+
+    def forward(self, x):
+        return self.base_model(x)
+
+class GazeKalmanFilter:
+    def __init__(self):
+        self.kf = cv2.KalmanFilter(3, 3)
+        self.kf.measurementMatrix = np.eye(3, dtype=np.float32)
+        self.kf.transitionMatrix = np.eye(3, dtype=np.float32)
+        self.kf.processNoiseCov = np.eye(3, dtype=np.float32) * 0.003
+        self.kf.measurementNoiseCov = np.eye(3, dtype=np.float32) * 0.03
+
+    def update(self, measurement):
+        self.kf.predict()
+        return self.kf.correct(measurement.reshape(3, 1)).flatten()
 
 async def process_image(image: Image.Image) -> Dict:
     """Process image with all models"""
