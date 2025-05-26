@@ -565,6 +565,7 @@ CHEATING_WEIGHTS = {
     "multiple_faces": 30,
     "non_frontal_pose": 10,
     "suspicious_object": 20,
+    "suspicious_gaze": 15,
 }
 
 
@@ -671,6 +672,7 @@ def detect_objects(image: Image.Image) -> List[Dict]:
         print(f"Error in detect_objects: {str(e)}")
         return []
 
+
 # Gaze tracking model definition
 class GazeResNet18(nn.Module):
     def __init__(self):
@@ -685,11 +687,12 @@ class GazeResNet18(nn.Module):
             nn.ReLU(),
             nn.Dropout(0.3),
             nn.Linear(256, 3),
-            nn.Tanh()
+            nn.Tanh(),
         )
 
     def forward(self, x):
         return self.base_model(x)
+
 
 class GazeKalmanFilter:
     def __init__(self):
@@ -703,22 +706,221 @@ class GazeKalmanFilter:
         self.kf.predict()
         return self.kf.correct(measurement.reshape(3, 1)).flatten()
 
+
+def extract_eye_region(image, landmarks, eye_indices, expand_ratio=0.2, min_size=20):
+    points = np.array(
+        [
+            (landmarks[i].x * image.shape[1], landmarks[i].y * image.shape[0])
+            for i in eye_indices
+        ]
+    )
+    x_min, y_min = np.min(points, axis=0)
+    x_max, y_max = np.max(points, axis=0)
+
+    width = x_max - x_min
+    height = y_max - y_min
+    x_min = max(0, int(x_min - width * expand_ratio))
+    y_min = max(0, int(y_min - height * expand_ratio))
+    x_max = min(image.shape[1], int(x_max + width * expand_ratio))
+    y_max = min(image.shape[0], int(y_max + height * expand_ratio))
+
+    return image[y_min:y_max, x_min:x_max], (x_min, y_min, x_max, y_max)
+
+
+def preprocess_eye(eye_img):
+    transform = transforms.Compose(
+        [
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ]
+    )
+    return transform(Image.fromarray(cv2.cvtColor(eye_img, cv2.COLOR_BGR2RGB)))
+
+
+def classify_gaze(gaze_vector, yaw_thresh=15):
+    normalized = gaze_vector / (np.linalg.norm(gaze_vector) + 1e-6)
+    x, y, z = normalized
+
+    yaw = np.degrees(np.arctan2(x, z + 1e-6))
+    pitch = np.degrees(np.arcsin(y * 0.75))
+    yaw = (yaw + 180) % 360 - 180
+    if yaw > 90:
+        yaw -= 180
+    elif yaw < -90:
+        yaw += 180
+
+    dynamic_scale = 1.2 - (abs(pitch) / 45)
+    yaw_thresh *= dynamic_scale
+
+    pitch_down_thresh = 6.0
+    pitch_up_thresh = 11.0
+
+    horizontal = (
+        "Right" if yaw > yaw_thresh else "Left" if yaw < -yaw_thresh else "Center"
+    )
+    vertical = (
+        "Down"
+        if pitch > pitch_down_thresh
+        else "Up" if pitch < -pitch_up_thresh else "Center"
+    )
+
+    if vertical != "Center":
+        direction = (
+            f"{vertical} {horizontal}" if horizontal != "Center" else f"{vertical}"
+        )
+    else:
+        direction = f"{horizontal}"
+
+    return direction.strip(), yaw, pitch
+
+
+def detect_gaze(image: Image.Image) -> Dict:
+    """Run gaze tracking on the image"""
+    print("Starting gaze detection...")
+    try:
+        # Convert PIL Image to OpenCV format
+        image_np = np.array(image)
+        image_cv = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
+        image_cv = cv2.resize(image_cv, (640, 640))
+        image_cv = cv2.flip(image_cv, 1)
+        print("Image converted for gaze detection.")
+
+        # Face detection
+        results = mp_face.process(cv2.cvtColor(image_cv, cv2.COLOR_BGR2RGB))
+        if not results.detections:
+            print("Gaze detection: No face detected by MediaPipe.")
+            return {"status": "no_face_detected", "message": "No face detected"}
+
+        # Face mesh for landmarks
+        mesh_results = mp_face_mesh.process(image_cv)
+        if not mesh_results.multi_face_landmarks:
+            print("Gaze detection: Face detected but no landmarks found.")
+            return {
+                "status": "no_face_landmarks",
+                "message": "Face detected but no landmarks",
+            }
+
+        face_landmarks = mesh_results.multi_face_landmarks[0]
+        print("Gaze detection: Face landmarks detected.")
+
+        # Process both eyes
+        left_eye, left_box = extract_eye_region(
+            image_cv,
+            face_landmarks.landmark,
+            [
+                33,
+                7,
+                163,
+                144,
+                145,
+                153,
+                154,
+                155,
+                133,
+                173,
+                157,
+                158,
+                159,
+                160,
+                161,
+                246,
+            ],
+        )
+        right_eye, right_box = extract_eye_region(
+            image_cv,
+            face_landmarks.landmark,
+            [
+                362,
+                382,
+                381,
+                380,
+                374,
+                373,
+                390,
+                249,
+                263,
+                466,
+                388,
+                387,
+                386,
+                385,
+                384,
+                398,
+            ],
+        )
+        print("Gaze detection: Eye regions extracted.")
+
+        # Get gaze predictions
+        with torch.no_grad():
+            left_input = preprocess_eye(left_eye).unsqueeze(0).to(device)
+            right_input = preprocess_eye(right_eye).unsqueeze(0).to(device)
+            left_gaze = gaze_model(left_input)[0].cpu().numpy()
+            right_gaze = gaze_model(right_input)[0].cpu().numpy()
+        print("Gaze detection: Gaze predictions obtained.")
+
+        # Temporal smoothing
+        current_gaze = (left_gaze + right_gaze) / 2
+        gaze_history.append(current_gaze)
+        smoothed_gaze = np.mean(gaze_history, axis=0)
+
+        # Kalman filtering
+        filtered_gaze = kf.update(smoothed_gaze)
+
+        # Classify gaze direction
+        direction, yaw, pitch = classify_gaze(filtered_gaze)
+        print(
+            f"Gaze detection successful: direction={direction}, yaw={yaw}, pitch={pitch}"
+        )
+
+        return {
+            "status": "success",
+            "gaze_direction": direction,
+            "yaw_degrees": float(yaw),
+            "pitch_degrees": float(pitch),
+            "gaze_vector": filtered_gaze.tolist(),
+        }
+    except Exception as e:
+        print(f"Error in detect_gaze: {str(e)}")
+        return {"status": "error", "message": str(e)}
+
+
+import asyncio
+
+
 async def process_image(image: Image.Image) -> Dict:
     """Process image with all models"""
     try:
-        # Run face detection (not async)
-        faces = detect_faces(image)
+        # Define async wrappers for non-async detection functions
+        async def run_face_detection(img):
+            return detect_faces(img)
+
+        async def run_object_detection(img):
+            return detect_objects(img)
+
+        async def run_gaze_detection(img):
+            result = detect_gaze(img)
+            print(f"Gaze detection result: {result}")
+            return result
+
+        # Run all detections in parallel
+        face_task = run_face_detection(image)
+        head_pose_tasks = []
+        object_task = run_object_detection(image)
+        gaze_task = run_gaze_detection(image)
+
+        # Await all tasks
+        faces, suspicious_objects, gaze_result = await asyncio.gather(
+            face_task, object_task, gaze_task
+        )
 
         # Process head pose for each detected face
-        head_poses = []
         for face in faces:
             x1, y1, x2, y2 = face["bounding_box"]
             face_region = image.crop((x1, y1, x2, y2))
-            head_pose = await detect_head_pose(face_region)
-            head_poses.append(head_pose)
+            head_pose_tasks.append(detect_head_pose(face_region))
 
-        # Run object detection (not async)
-        suspicious_objects = detect_objects(image)
+        head_poses = await asyncio.gather(*head_pose_tasks)
 
         # Compute cheating score
         score_increment = 0
@@ -743,10 +945,23 @@ async def process_image(image: Image.Image) -> Dict:
             for obj in suspicious_objects:
                 alerts.append(f"Suspicious object detected: {obj['class']}")
 
+        # Check for suspicious gaze direction
+        if gaze_result["status"] == "success":
+            gaze_direction = gaze_result["gaze_direction"]
+            print(f"Processing gaze direction: {gaze_direction}")
+            if gaze_direction not in ["Center", "Up", "Down"]:
+                score_increment += CHEATING_WEIGHTS.get("suspicious_gaze", 15)
+                alerts.append(f"Suspicious gaze direction: {gaze_direction}")
+        elif gaze_result["status"] == "error":
+            print(f"Gaze detection failed: {gaze_result['message']}")
+        else:
+            print(f"Gaze detection status: {gaze_result['status']}, message: {gaze_result['message']}")
+
         return {
             "faces": faces,
             "head_poses": head_poses,
             "suspicious_objects": suspicious_objects,
+            "gaze_result": gaze_result,
             "score_increment": score_increment,
             "alerts": alerts,
         }
@@ -756,6 +971,7 @@ async def process_image(image: Image.Image) -> Dict:
             "faces": [],
             "head_poses": [],
             "suspicious_objects": [],
+            "gaze_result": {"status": "error", "message": str(e)},
             "alerts": [],
             "score_increment": 0,
         }
@@ -766,7 +982,75 @@ class RegisterRequest(BaseModel):
     images: List[str]
 
 
-app = FastAPI(title="Face Recognition API")
+face_db = FaceDB()
+fr = FaceRecognition()
+yolo = YOLO(FACE_MODEL_PATH).to("cuda" if torch.cuda.is_available() else "cpu")
+recognizer = RealTimeRecognizer()
+
+# New global variables for gaze tracking
+CHECKPOINT_DIR = r"C:/Users/pc/Desktop/GP/ML Code"
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+gaze_model = None
+mp_face = None
+mp_face_mesh = None
+gaze_history = deque(maxlen=5)
+kf = GazeKalmanFilter()
+
+from contextlib import asynccontextmanager
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global gaze_model, mp_face, mp_face_mesh, yolo_face, object_detector
+    try:
+        print("Loading YOLO face model...")
+        yolo_face = YOLO(FACE_MODEL_PATH).to(
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
+        print("YOLO face model loaded.")
+
+        print("Loading YOLO object detection model...")
+        object_detector = YOLO(os.getenv("OBJECT_DETECTION_MODEL_PATH")).to(
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
+        print("YOLO object detection model loaded.")
+
+        print("Loading gaze model...")
+        gaze_model = GazeResNet18()
+        checkpoint_path = os.path.join(CHECKPOINT_DIR, "best_gaze_model.pth")
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        if "model_state_dict" in checkpoint:
+            state_dict = checkpoint["model_state_dict"]
+        else:
+            state_dict = checkpoint
+        state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
+        gaze_model.load_state_dict(state_dict)
+        gaze_model.eval()
+        gaze_model.to(device)
+        print("Gaze model loaded.")
+
+        print("Loading MediaPipe face detection...")
+        mp_face = mp.solutions.face_detection.FaceDetection(
+            min_detection_confidence=0.5
+        )
+        print("MediaPipe face detection loaded.")
+
+        print("Loading MediaPipe face mesh...")
+        mp_face_mesh = mp.solutions.face_mesh.FaceMesh(
+            static_image_mode=False,
+            max_num_faces=1,
+            refine_landmarks=True,
+            min_tracking_confidence=0.3,
+        )
+        print("MediaPipe face mesh loaded.")
+    except Exception as e:
+        print(f"Failed to load models: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to load models: {str(e)}")
+    yield
+    print("Shutting down application...")
+
+
+app = FastAPI(title="Face Recognition API", lifespan=lifespan)
 
 # Store WebSocket connections by student_id and quiz_id
 connections: Dict[str, WebSocket] = {}
@@ -777,11 +1061,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-face_db = FaceDB()
-fr = FaceRecognition()
-yolo = YOLO(FACE_MODEL_PATH).to("cuda" if torch.cuda.is_available() else "cpu")
-recognizer = RealTimeRecognizer()
 
 
 @app.post("/register")
