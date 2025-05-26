@@ -562,10 +562,10 @@ ema_smoother = EMA(alpha=0.3)
 
 # Cheating score weights
 CHEATING_WEIGHTS = {
-    "multiple_faces": 30,
-    "non_frontal_pose": 10,
-    "suspicious_object": 20,
-    "suspicious_gaze": 15,
+    "multiple_faces": 20,
+    "non_frontal_pose": 5,
+    "suspicious_object": 15,
+    "suspicious_gaze": 10,
 }
 
 
@@ -950,7 +950,7 @@ async def process_image(image: Image.Image) -> Dict:
             gaze_direction = gaze_result["gaze_direction"]
             print(f"Processing gaze direction: {gaze_direction}")
             if gaze_direction not in ["Center", "Up", "Down"]:
-                score_increment += CHEATING_WEIGHTS.get("suspicious_gaze", 15)
+                score_increment += CHEATING_WEIGHTS.get("suspicious_gaze", 10)
                 alerts.append(f"Suspicious gaze direction: {gaze_direction}")
         elif gaze_result["status"] == "error":
             print(f"Gaze detection failed: {gaze_result['message']}")
