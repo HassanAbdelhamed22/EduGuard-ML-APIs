@@ -30,7 +30,7 @@ from typing import List, Dict
 import base64
 import uuid
 from mysql.connector import Error
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 from io import BytesIO
 from torchvision import transforms
 from PIL import Image
@@ -955,7 +955,9 @@ async def process_image(image: Image.Image) -> Dict:
         elif gaze_result["status"] == "error":
             print(f"Gaze detection failed: {gaze_result['message']}")
         else:
-            print(f"Gaze detection status: {gaze_result['status']}, message: {gaze_result['message']}")
+            print(
+                f"Gaze detection status: {gaze_result['status']}, message: {gaze_result['message']}"
+            )
 
         return {
             "faces": faces,
@@ -1196,6 +1198,11 @@ async def list_students():
         raise HTTPException(500, detail=str(e))
 
 
+class Answer(BaseModel):
+    question_id: int
+    answer: str
+
+
 # Pydantic model for /process_periodic input
 class ProcessPeriodicRequest(BaseModel):
     student_id: str
@@ -1203,13 +1210,14 @@ class ProcessPeriodicRequest(BaseModel):
     image_b64: str
     auth_token: str
     image_b64: str
+    answers: List[Answer] = []
 
 
 # Pydantic model for /submit_due_to_cheating input
 class SubmitDueToCheatingRequest(BaseModel):
     student_id: str
     quiz_id: str
-    answers: List[Dict[str, str]]  # List of {question_id, answer}
+    answers: List[Answer]
     auth_token: str
 
 
@@ -1247,6 +1255,7 @@ async def log_cheating_to_laravel(
     score_increment: int,
     auth_token: str,
     image_b64: str = None,
+    answers: List[Dict[str, str]] = None,
 ):
     """Send suspicious behaviors and score update to Laravel, and cheating image to Laravel"""
     async with httpx.AsyncClient() as client:
@@ -1259,6 +1268,8 @@ async def log_cheating_to_laravel(
             }
             if image_b64:  # Include image data if provided
                 payload["image_b64"] = image_b64
+            if answers:
+                payload["answers"] = answers
 
             response = await client.post(
                 "http://localhost:8000/api/quizzes/update-cheating-score",
@@ -1288,11 +1299,21 @@ async def submit_to_laravel(
     """Submit quiz answers to Laravel when cheating score reaches 100"""
     async with httpx.AsyncClient() as client:
         try:
+            # Ensure answers is a list of plain dictionaries
+            serialized_answers = [
+                (
+                    {"question_id": answer["question_id"], "answer": answer["answer"]}
+                    if isinstance(answer, dict)
+                    else {"question_id": answer.question_id, "answer": answer.answer}
+                )
+                for answer in answers
+            ]
+            print(f"Sending answers to Laravel: {serialized_answers}")
             response = await client.post(
                 f"http://localhost:8000/api/quizzes/submit/{quiz_id}",
                 json={
                     "student_id": student_id,
-                    "answers": answers,
+                    "answers": serialized_answers,
                 },
                 headers={
                     "Authorization": f"Bearer {auth_token}",
@@ -1363,6 +1384,15 @@ async def process_periodic(request: ProcessPeriodicRequest):
                 "process_image result missing 'alerts' or 'score_increment'"
             )
         if result["alerts"]:
+            # Convert answers to plain dictionaries
+            serialized_answers = (
+                [
+                    {"question_id": answer.question_id, "answer": answer.answer}
+                    for answer in request.answers
+                ]
+                if hasattr(request, "answers")
+                else []
+            )
             laravel_response = await log_cheating_to_laravel(
                 request.student_id,
                 request.quiz_id,
@@ -1370,17 +1400,16 @@ async def process_periodic(request: ProcessPeriodicRequest):
                 result["score_increment"],
                 request.auth_token,
                 request.image_b64,
+                serialized_answers,
             )
             ws_message = {
                 "type": "alert",
                 "message": result["alerts"],
                 "score_increment": result["score_increment"],
-                "auto_submitted": laravel_response.get(
-                    "auto_submitted", False
-                ),  # Forward flag
+                "auto_submitted": laravel_response.get("auto_submitted", False),
                 "new_score": laravel_response.get(
                     "new_score", laravel_response.get("score", 0)
-                ),  # Use new_score or fallback to score
+                ),
             }
             await notify_client(request.student_id, request.quiz_id, ws_message)
         return JSONResponse(content=result)
@@ -1398,10 +1427,15 @@ async def process_periodic(request: ProcessPeriodicRequest):
 @app.post("/submit_due_to_cheating")
 async def submit_due_to_cheating(request: SubmitDueToCheatingRequest):
     try:
+        # Convert Pydantic Answer objects to plain dictionaries
+        serialized_answers = [
+            {"question_id": answer.question_id, "answer": answer.answer}
+            for answer in request.answers
+        ]
         response = await submit_to_laravel(
             request.student_id,
             request.quiz_id,
-            request.answers,
+            serialized_answers,
             request.auth_token,
         )
         if response["status"] == 200:
@@ -1409,9 +1443,17 @@ async def submit_due_to_cheating(request: SubmitDueToCheatingRequest):
                 content={"status": 200, "message": "Quiz submitted due to cheating"}
             )
         else:
+            print(f"Failed to submit to Laravel: {response['data']}")
             return JSONResponse(
-                content=response["data"], status_code=response["status"]
+                content={
+                    "error": "Failed to submit quiz to Laravel",
+                    "details": response["data"],
+                },
+                status_code=response["status"],
             )
+    except ValidationError as ve:
+        print(f"Validation error in submit_due_to_cheating: {ve.errors()}")
+        raise HTTPException(status_code=422, detail=ve.errors())
     except Exception as e:
         print(f"Error in submit_due_to_cheating: {str(e)}")
         return JSONResponse(content={"error": str(e)}, status_code=500)
