@@ -886,10 +886,15 @@ def detect_gaze(image: Image.Image) -> Dict:
         print(f"Error in detect_gaze: {str(e)}")
         return {"status": "error", "message": str(e)}
 
-# Global dictionary to track non-frontal pose detections per session
-non_frontal_pose_counts: Dict[str, int] = {}
 
-async def process_image(image: Image.Image, student_id: str = None, quiz_id: str = None) -> Dict:
+# Global dictionaries to track non-frontal pose and suspicious gaze detections per session
+non_frontal_pose_counts: Dict[str, int] = {}
+suspicious_gaze_counts: Dict[str, int] = {}
+
+
+async def process_image(
+    image: Image.Image, student_id: str = None, quiz_id: str = None
+) -> Dict:
     """Process image with all models"""
     try:
         # Define async wrappers for non-async detection functions
@@ -926,7 +931,7 @@ async def process_image(image: Image.Image, student_id: str = None, quiz_id: str
         # Compute cheating score
         score_increment = 0
         alerts = []
-        
+
         # Generate session key if student_id and quiz_id are provided
         session_key = f"{student_id}_{quiz_id}" if student_id and quiz_id else None
 
@@ -941,8 +946,11 @@ async def process_image(image: Image.Image, student_id: str = None, quiz_id: str
         # Check for non-frontal pose
         non_frontal_poses = [pose for pose in head_poses if pose["pose"] != "frontal"]
         if non_frontal_poses and session_key:
+            alerts.append("Non-frontal pose detected")
             # Increment the non-frontal pose counter
-            non_frontal_pose_counts[session_key] = non_frontal_pose_counts.get(session_key, 0) + 1
+            non_frontal_pose_counts[session_key] = (
+                non_frontal_pose_counts.get(session_key, 0) + 1
+            )
             if non_frontal_pose_counts[session_key] >= 3:
                 score_increment += CHEATING_WEIGHTS["non_frontal_pose"]
                 alerts.append("Non-frontal pose detected (3rd occurrence)")
@@ -950,6 +958,9 @@ async def process_image(image: Image.Image, student_id: str = None, quiz_id: str
                 non_frontal_pose_counts[session_key] = 0
         elif non_frontal_poses:
             alerts.append("Non-frontal pose detected")
+        elif session_key:
+            # Reset counter if no non-frontal pose is detected
+            non_frontal_pose_counts[session_key] = 0
 
         # Check for suspicious objects
         if suspicious_objects:
@@ -961,9 +972,20 @@ async def process_image(image: Image.Image, student_id: str = None, quiz_id: str
         if gaze_result["status"] == "success":
             gaze_direction = gaze_result["gaze_direction"]
             print(f"Processing gaze direction: {gaze_direction}")
-            if gaze_direction not in ["Center", "Up", "Down"]:
-                score_increment += CHEATING_WEIGHTS.get("suspicious_gaze", 5)
+            if gaze_direction not in ["Center", "Up", "Down"] and session_key:
                 alerts.append(f"Suspicious gaze direction: {gaze_direction}")
+                # Increment the suspicious gaze counter
+                suspicious_gaze_counts[session_key] = (
+                    suspicious_gaze_counts.get(session_key, 0) + 1
+                )
+                if suspicious_gaze_counts[session_key] >= 3:
+                    score_increment += CHEATING_WEIGHTS["suspicious_gaze"]
+                    alerts.append("Suspicious gaze threshold reached (3rd occurrence)")
+                    # Reset the counter after incrementing the score
+                    suspicious_gaze_counts[session_key] = 0
+            elif session_key:
+                # Reset counter if no suspicious gaze is detected
+                suspicious_gaze_counts[session_key] = 0
         elif gaze_result["status"] == "error":
             print(f"Gaze detection failed: {gaze_result['message']}")
         else:
@@ -1247,11 +1269,15 @@ async def websocket_endpoint(websocket: WebSocket, student_id: str, quiz_id: str
             del connections[session_key]
         if session_key in non_frontal_pose_counts:
             del non_frontal_pose_counts[session_key]
+        if session_key in suspicious_gaze_counts:
+            del suspicious_gaze_counts[session_key]
     finally:
         if session_key in connections:
             del connections[session_key]
         if session_key in non_frontal_pose_counts:
             del non_frontal_pose_counts[session_key]
+        if session_key in suspicious_gaze_counts:
+            del suspicious_gaze_counts[session_key]
 
 
 async def notify_client(student_id: str, quiz_id: str, message: dict):
