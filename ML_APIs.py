@@ -565,7 +565,8 @@ CHEATING_WEIGHTS = {
     "multiple_faces": 20,
     "non_frontal_pose": 5,
     "suspicious_object": 15,
-    "suspicious_gaze": 10,
+    "suspicious_gaze": 5,
+    "no_faces_detected": 10,
 }
 
 
@@ -932,6 +933,7 @@ async def process_image(image: Image.Image) -> Dict:
             alerts.append("Multiple faces detected")
         elif len(faces) == 0:
             alerts.append("No faces detected")
+            score_increment += CHEATING_WEIGHTS["no_faces_detected"]
 
         # Check for non-frontal pose
         non_frontal_poses = [pose for pose in head_poses if pose["pose"] != "frontal"]
@@ -950,7 +952,7 @@ async def process_image(image: Image.Image) -> Dict:
             gaze_direction = gaze_result["gaze_direction"]
             print(f"Processing gaze direction: {gaze_direction}")
             if gaze_direction not in ["Center", "Up", "Down"]:
-                score_increment += CHEATING_WEIGHTS.get("suspicious_gaze", 10)
+                score_increment += CHEATING_WEIGHTS.get("suspicious_gaze", 5)
                 alerts.append(f"Suspicious gaze direction: {gaze_direction}")
         elif gaze_result["status"] == "error":
             print(f"Gaze detection failed: {gaze_result['message']}")
