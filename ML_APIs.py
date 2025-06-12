@@ -42,6 +42,7 @@ import httpx
 import mediapipe as mp
 from collections import deque
 import torch.nn as nn
+import asyncio
 
 # Load environment variables from .env file
 load_dotenv()
@@ -885,11 +886,10 @@ def detect_gaze(image: Image.Image) -> Dict:
         print(f"Error in detect_gaze: {str(e)}")
         return {"status": "error", "message": str(e)}
 
+# Global dictionary to track non-frontal pose detections per session
+non_frontal_pose_counts: Dict[str, int] = {}
 
-import asyncio
-
-
-async def process_image(image: Image.Image) -> Dict:
+async def process_image(image: Image.Image, student_id: str = None, quiz_id: str = None) -> Dict:
     """Process image with all models"""
     try:
         # Define async wrappers for non-async detection functions
@@ -926,6 +926,9 @@ async def process_image(image: Image.Image) -> Dict:
         # Compute cheating score
         score_increment = 0
         alerts = []
+        
+        # Generate session key if student_id and quiz_id are provided
+        session_key = f"{student_id}_{quiz_id}" if student_id and quiz_id else None
 
         # Check for multiple faces
         if len(faces) > 1:
@@ -937,8 +940,15 @@ async def process_image(image: Image.Image) -> Dict:
 
         # Check for non-frontal pose
         non_frontal_poses = [pose for pose in head_poses if pose["pose"] != "frontal"]
-        if non_frontal_poses:
-            score_increment += CHEATING_WEIGHTS["non_frontal_pose"]
+        if non_frontal_poses and session_key:
+            # Increment the non-frontal pose counter
+            non_frontal_pose_counts[session_key] = non_frontal_pose_counts.get(session_key, 0) + 1
+            if non_frontal_pose_counts[session_key] >= 3:
+                score_increment += CHEATING_WEIGHTS["non_frontal_pose"]
+                alerts.append("Non-frontal pose detected (3rd occurrence)")
+                # Reset the counter after incrementing the score
+                non_frontal_pose_counts[session_key] = 0
+        elif non_frontal_poses:
             alerts.append("Non-frontal pose detected")
 
         # Check for suspicious objects
@@ -1231,13 +1241,17 @@ async def websocket_endpoint(websocket: WebSocket, student_id: str, quiz_id: str
     try:
         while True:
             data = await websocket.receive_text()
-            print(f"Received WebSocket message: {data}")  # Log incoming messages
+            print(f"Received WebSocket message: {data}")
     except WebSocketDisconnect:
         if session_key in connections:
             del connections[session_key]
+        if session_key in non_frontal_pose_counts:
+            del non_frontal_pose_counts[session_key]
     finally:
         if session_key in connections:
             del connections[session_key]
+        if session_key in non_frontal_pose_counts:
+            del non_frontal_pose_counts[session_key]
 
 
 async def notify_client(student_id: str, quiz_id: str, message: dict):
@@ -1378,7 +1392,7 @@ async def process_periodic(request: ProcessPeriodicRequest):
         else:
             image_data = base64.b64decode(image_b64)
         image = Image.open(io.BytesIO(image_data)).convert("RGB")
-        result = await process_image(image)
+        result = await process_image(image, request.student_id, request.quiz_id)
         if not isinstance(result, dict):
             raise ValueError("process_image must return a dictionary")
         if "alerts" not in result or "score_increment" not in result:
